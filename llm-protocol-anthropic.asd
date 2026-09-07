@@ -12,6 +12,7 @@
   :serial t
   :pathname "src"
   :components ((:file "package")
+               (:file "tools")
                (:file "backend")
                (:file "stream"))
   :in-order-to ((test-op (test-op "llm-protocol-anthropic/tests"))))

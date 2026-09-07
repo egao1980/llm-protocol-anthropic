@@ -12,6 +12,10 @@
   (let ((v (uiop:getenv name)))
     (and v (plusp (length v)) v)))
 
+(defvar *anthropic-dialect* :official
+  "Bound while wiring a request. :official = Anthropic-native tool types.
+   :compat = flatten to name + input_schema (vLLM / llama-server).")
+
 (defclass anthropic-backend (llm-backend)
   ((base-url :initarg :base-url :accessor anthropic-base-url
              :initform +default-anthropic-base-url+)
@@ -20,10 +24,12 @@
                   :initform "claude-sonnet-4-20250514")
    (version :initarg :version :accessor anthropic-version
             :initform +default-anthropic-version+)
+   (betas :initarg :betas :accessor anthropic-betas :initform nil)
+   (dialect :initarg :dialect :accessor anthropic-dialect :initform :official)
    (request-fn :initarg :request-fn :accessor anthropic-request-fn :initform nil)))
 
 (defun make-anthropic-backend (&key base-url api-key default-model version
-                                 request-fn)
+                                 betas dialect request-fn)
   (make-instance 'anthropic-backend
                  :base-url (or base-url (%env "ANTHROPIC_BASE_URL")
                                +default-anthropic-base-url+)
@@ -33,23 +39,32 @@
                                     "claude-sonnet-4-20250514")
                  :version (or version (%env "ANTHROPIC_VERSION")
                               +default-anthropic-version+)
+                 :betas (or betas
+                            (let ((v (%env "ANTHROPIC_BETA")))
+                              (and v (uiop:split-string v :separator ","))))
+                 :dialect (or dialect :official)
                  :request-fn request-fn))
 
-(defun make-vllm-anthropic-backend (&rest args &key base-url &allow-other-keys)
+(defun make-vllm-anthropic-backend (&rest args &key base-url dialect
+                                    &allow-other-keys)
   (let ((args (copy-list args)))
     (remf args :base-url)
+    (remf args :dialect)
     (apply #'make-anthropic-backend
            :base-url (or base-url (%env "ANTHROPIC_BASE_URL")
                          +default-vllm-base-url+)
+           :dialect (or dialect :compat)
            args)))
 
-(defun make-llama-server-anthropic-backend (&rest args &key base-url
+(defun make-llama-server-anthropic-backend (&rest args &key base-url dialect
                                             &allow-other-keys)
   (let ((args (copy-list args)))
     (remf args :base-url)
+    (remf args :dialect)
     (apply #'make-anthropic-backend
            :base-url (or base-url (%env "ANTHROPIC_BASE_URL")
                          +default-llama-server-base-url+)
+           :dialect (or dialect :compat)
            args)))
 
 (defun use-anthropic-backend (&rest args &key &allow-other-keys)
@@ -70,6 +85,10 @@
 (defmethod backend-supports-p ((backend anthropic-backend)
                                (feature (eql :thinking)))
   t)
+
+(defmethod backend-supports-p ((backend anthropic-backend)
+                               (feature (eql :native-tools)))
+  (not (eq (anthropic-dialect backend) :compat)))
 
 (defun %ht (&rest kvs)
   (let ((h (make-hash-table :test 'equal)))
@@ -92,6 +111,13 @@
       (push (cons "authorization"
                   (format nil "Bearer ~a" (anthropic-api-key backend)))
             h))
+    (let ((betas (anthropic-betas backend)))
+      (when betas
+        (push (cons "anthropic-beta"
+                    (if (stringp betas)
+                        betas
+                        (format nil "~{~a~^,~}" (llm-protocol::%as-list betas))))
+              h)))
     h))
 
 (defun %body-string (response)
@@ -171,8 +197,29 @@
      (or (ignore-errors (stack-json:decode arguments)) (%ht)))
     (t arguments)))
 
+(defun %wire-tool-call (part)
+  (let ((h (%ht "type" (if (and (not (eq *anthropic-dialect* :compat))
+                                (anthropic-tool-call-part-p part)
+                                (anthropic-tool-call-server-p part))
+                           "server_tool_use"
+                           "tool_use")
+                "id" (or (llm-tool-call-part-id part) "toolu_0")
+                "name" (llm-tool-call-part-name part)
+                "input" (%json-args (llm-tool-call-part-arguments part)))))
+    (when (anthropic-tool-call-part-p part)
+      (%put-options h (anthropic-tool-call-extras part)))
+    h))
+
 (defun %wire-part (part)
   (etypecase part
+    (anthropic-block-part
+     (let ((b (anthropic-block-part-block part)))
+       (if (hash-table-p b) b nil)))
+    (anthropic-text-part
+     (let ((h (%ht "type" "text" "text" (or (llm-text-part-text part) ""))))
+       (when (anthropic-text-citations part)
+         (setf (gethash "citations" h) (anthropic-text-citations part)))
+       h))
     (llm-text-part
      (%ht "type" "text" "text" (or (llm-text-part-text part) "")))
     (llm-image-part
@@ -190,10 +237,7 @@
          (setf (gethash "signature" h) (llm-thinking-part-signature part)))
        h))
     (llm-tool-call-part
-     (%ht "type" "tool_use"
-          "id" (or (llm-tool-call-part-id part) "toolu_0")
-          "name" (llm-tool-call-part-name part)
-          "input" (%json-args (llm-tool-call-part-arguments part))))
+     (%wire-tool-call part))
     (llm-tool-result-part
      (%ht "type" "tool_result"
           "tool_use_id" (llm-tool-result-part-id part)
@@ -244,12 +288,24 @@
 
 (defun %wire-tool (tool)
   (cond
+    ((anthropic-tool-p tool)
+     (if (eq *anthropic-dialect* :compat)
+         (%wire-compat-tool tool)
+         (%wire-native-tool tool)))
+    ((keywordp tool)
+     (%wire-tool (make-anthropic-tool tool)))
+    ((stringp tool)
+     (%wire-tool (make-anthropic-tool tool)))
     ((llm-tool-p tool)
      (%ht "name" (llm-tool-name tool)
           "description" (or (llm-tool-description tool) "")
           "input_schema" (or (llm-tool-parameters tool)
                              (%ht "type" "object" "properties" (%ht)))))
     ((hash-table-p tool) tool)
+    ((and (consp tool) (keywordp (car tool)) (or (getf tool :type) (getf tool :kind)))
+     (%wire-tool (apply #'make-anthropic-tool
+                        (or (getf tool :kind) :web-search)
+                        tool)))
     ((and (consp tool) (keywordp (car tool)))
      (%wire-tool (make-llm-tool :name (getf tool :name)
                                 :description (getf tool :description)
@@ -286,7 +342,8 @@
     body))
 
 (defun %messages-body (backend turns &key model settings tools tool-choice stream)
-  (let* ((settings (coerce-settings settings))
+  (let* ((*anthropic-dialect* (or (anthropic-dialect backend) :official))
+         (settings (coerce-settings settings))
          (model (or model (anthropic-default-model backend)))
          (max (or (and settings (llm-settings-max-tokens settings)) 4096)))
     (multiple-value-bind (system messages)
@@ -311,6 +368,7 @@
     ((or (string-equal raw "end_turn") (string-equal raw "stop_sequence")) :stop)
     ((string-equal raw "max_tokens") :length)
     ((string-equal raw "tool_use") :tool-use)
+    ((or (string-equal raw "pause_turn") (string-equal raw "refusal")) :stop)
     (t :stop)))
 
 (defun %usage (obj)
@@ -320,22 +378,49 @@
       (make-llm-usage :input-tokens in :output-tokens out
                       :total-tokens (+ in out)))))
 
+(defun %tool-call-extras (block)
+  (let ((extras nil))
+    (maphash (lambda (k v)
+               (unless (member k '("type" "id" "name" "input") :test #'string-equal)
+                 (setf extras (list* (intern (string-upcase
+                                              (substitute #\- #\_ k))
+                                             :keyword)
+                                     v extras))))
+             block)
+    extras))
+
 (defun %parse-block (block)
   (when (hash-table-p block)
     (let ((type (gethash "type" block)))
       (cond
         ((string-equal type "text")
-         (make-llm-text-part :text (%str (gethash "text" block))))
+         (let ((cites (gethash "citations" block)))
+           (if cites
+               (make-instance 'anthropic-text-part
+                              :text (%str (gethash "text" block))
+                              :citations cites)
+               (make-llm-text-part :text (%str (gethash "text" block))))))
         ((string-equal type "thinking")
          (make-llm-thinking-part :text (%str (gethash "thinking" block))
                                  :signature (gethash "signature" block)))
-        ((string-equal type "tool_use")
-         (make-llm-tool-call-part
-          :id (gethash "id" block)
-          :name (gethash "name" block)
-          :arguments (let ((in (gethash "input" block)))
-                       (if (stringp in) in (stack-json:encode (or in (%ht)))))))
-        (t nil)))))
+        ((string-equal type "redacted_thinking")
+         (make-llm-thinking-part :text (%str (or (gethash "data" block) ""))
+                                 :signature :redacted))
+        ((or (string-equal type "tool_use") (%server-call-type-p type))
+         (make-instance 'anthropic-tool-call-part
+                        :id (gethash "id" block)
+                        :name (gethash "name" block)
+                        :arguments (let ((in (gethash "input" block)))
+                                     (if (stringp in)
+                                         in
+                                         (stack-json:encode (or in (%ht)))))
+                        :server-p (%server-call-type-p type)
+                        :extras (%tool-call-extras block)))
+        ((or (%server-result-type-p type)
+             (string-equal type "document")
+             (string-equal type "container_upload"))
+         (make-anthropic-block-part block))
+        (t (and type (make-anthropic-block-part block)))))))
 
 (defun %parse-message (obj requested-model)
   (let* ((blocks (llm-protocol::%as-list (and (hash-table-p obj)

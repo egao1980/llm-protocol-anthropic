@@ -392,9 +392,11 @@
     (ok (equal "http://127.0.0.1:8000/v1"
                (llm-protocol-anthropic:anthropic-base-url v)))
     (ok (equal "qwen" (llm-protocol-anthropic:anthropic-default-model v)))
+    (ok (eq :compat (llm-protocol-anthropic:anthropic-dialect v)))
     (ok (equal "http://127.0.0.1:8080/v1"
                (llm-protocol-anthropic:anthropic-base-url l)))
     (ok (equal "local" (llm-protocol-anthropic:anthropic-default-model l)))
+    (ok (eq :compat (llm-protocol-anthropic:anthropic-dialect l)))
     (ok (equal "http://127.0.0.1:8000/v1"
                llm-protocol-anthropic:+default-vllm-base-url+))
     (ok (equal "http://127.0.0.1:8080/v1"
@@ -402,9 +404,233 @@
 
 (deftest anthropic-supports
   (let ((b (llm-protocol-anthropic:make-anthropic-backend
+            :request-fn #'%fake-anthropic))
+        (v (llm-protocol-anthropic:make-vllm-anthropic-backend
             :request-fn #'%fake-anthropic)))
     (ok (llm-protocol:backend-supports-p b :tools))
     (ok (llm-protocol:backend-supports-p b :stream))
     (ok (llm-protocol:backend-supports-p b :vision))
     (ok (llm-protocol:backend-supports-p b :thinking))
-    (ng (llm-protocol:backend-supports-p b :embeddings))))
+    (ok (llm-protocol:backend-supports-p b :native-tools))
+    (ng (llm-protocol:backend-supports-p b :embeddings))
+    (ok (llm-protocol:backend-supports-p v :tools))
+    (ng (llm-protocol:backend-supports-p v :native-tools))))
+
+(deftest anthropic-native-tool-official-wire
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-anthropic :post "http://x/v1/messages" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-anthropic:make-anthropic-backend :request-fn #'capture)
+       "search"
+       :tools (list (llm-protocol-anthropic:make-web-search-tool :max-uses 3)
+                    :bash))
+      (let ((t0 (elt (gethash "tools" seen) 0))
+            (t1 (elt (gethash "tools" seen) 1)))
+        (ok (equal "web_search_20260209" (gethash "type" t0)))
+        (ok (equal "web_search" (gethash "name" t0)))
+        (ok (= 3 (gethash "max_uses" t0)))
+        (ok (equal "bash_20250124" (gethash "type" t1)))
+        (ok (equal "bash" (gethash "name" t1)))))))
+
+(deftest anthropic-native-tool-compat-flatten
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-anthropic :post "http://x/v1/messages" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-anthropic:make-vllm-anthropic-backend :request-fn #'capture)
+       "search"
+       :tools (list (llm-protocol-anthropic:make-web-search-tool :max-uses 3)
+                    :bash))
+      (let ((t0 (elt (gethash "tools" seen) 0))
+            (t1 (elt (gethash "tools" seen) 1)))
+        (ok (equal "web_search" (gethash "name" t0)))
+        (ok (hash-table-p (gethash "input_schema" t0)))
+        (ok (equal "object" (gethash "type" (gethash "input_schema" t0))))
+        (ok (gethash "query" (gethash "properties" (gethash "input_schema" t0))))
+        (ng (equal "web_search_20260209" (gethash "type" t0)))
+        (ng (gethash "max_uses" t0))
+        (ok (equal "bash" (gethash "name" t1)))
+        (ok (hash-table-p (gethash "input_schema" t1)))
+        (ng (equal "bash_20250124" (gethash "type" t1)))))))
+
+(defun %fake-server-search (method url &key headers content want-stream)
+  (declare (ignore method url headers))
+  (let ((payload
+          (stack-json:encode
+           (%ht "id" "msg_srv"
+                "model" "claude-sonnet-4-20250514"
+                "stop_reason" "end_turn"
+                "usage" (%ht "input_tokens" 4 "output_tokens" 6)
+                "content"
+                (vector (%ht "type" "text" "text" "found")
+                        (%ht "type" "server_tool_use"
+                             "id" "srv_1"
+                             "name" "web_search"
+                             "input" (%ht "query" "cl"))
+                        (%ht "type" "web_search_tool_result"
+                             "tool_use_id" "srv_1"
+                             "content" (vector (%ht "url" "https://x"))))))))
+    (if want-stream
+        (values 200
+                (with-output-to-string (s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "message_start"
+                          "message" (%ht "id" "msg_srv"
+                                         "model" "claude-sonnet-4-20250514"
+                                         "usage" (%ht "input_tokens" 4
+                                                      "output_tokens" 0))))
+                    "message_start")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "content_block_start"
+                          "index" 0
+                          "content_block" (%ht "type" "text" "text" "")))
+                    "content_block_start")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "content_block_delta"
+                          "index" 0
+                          "delta" (%ht "type" "text_delta" "text" "found")))
+                    "content_block_delta")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode (%ht "type" "content_block_stop" "index" 0))
+                    "content_block_stop")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "content_block_start"
+                          "index" 1
+                          "content_block" (%ht "type" "server_tool_use"
+                                               "id" "srv_1"
+                                               "name" "web_search"
+                                               "input" (%ht))))
+                    "content_block_start")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "content_block_delta"
+                          "index" 1
+                          "delta" (%ht "type" "input_json_delta"
+                                       "partial_json" "{\"query\":\"cl\"}")))
+                    "content_block_delta")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode (%ht "type" "content_block_stop" "index" 1))
+                    "content_block_stop")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "content_block_start"
+                          "index" 2
+                          "content_block"
+                          (%ht "type" "web_search_tool_result"
+                               "tool_use_id" "srv_1"
+                               "content" (vector (%ht "url" "https://x")))))
+                    "content_block_start")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode (%ht "type" "content_block_stop" "index" 2))
+                    "content_block_stop")
+                   s)
+                  (write-string
+                   (%sse-block
+                    (stack-json:encode
+                     (%ht "type" "message_delta"
+                          "delta" (%ht "stop_reason" "end_turn")
+                          "usage" (%ht "output_tokens" 6)))
+                    "message_delta")
+                   s)
+                  (write-string
+                   (%sse-block (stack-json:encode (%ht "type" "message_stop"))
+                               "message_stop")
+                   s)))
+        (values 200 payload))))
+
+(deftest anthropic-server-tool-use-parse
+  (let* ((backend (llm-protocol-anthropic:make-anthropic-backend
+                   :request-fn #'%fake-server-search))
+         (r (llm-protocol:generate backend "search"
+                                   :tools (list (llm-protocol-anthropic:make-web-search-tool)))))
+    (ok (eq :stop (llm-protocol:llm-response-finish-reason r)))
+    (ok (equal "found" (llm-protocol:llm-response-text r)))
+    (let ((call (first (llm-protocol:llm-response-tool-calls r))))
+      (ok (llm-protocol-anthropic:anthropic-tool-call-part-p call))
+      (ok (llm-protocol-anthropic:anthropic-tool-call-server-p call))
+      (ok (equal "web_search" (llm-protocol:llm-tool-call-part-name call)))
+      (ok (search "cl" (llm-protocol:llm-tool-call-part-arguments call))))
+    (ok (find-if #'llm-protocol-anthropic:anthropic-block-part-p
+                 (llm-protocol:llm-response-parts r)))))
+
+(deftest anthropic-stream-server-tool-use
+  (let* ((backend (llm-protocol-anthropic:make-anthropic-backend
+                   :request-fn #'%fake-server-search))
+         (r (llm-protocol:stream-generate
+             backend "search"
+             :tools (list (llm-protocol-anthropic:make-web-search-tool)))))
+    (ok (eq :stop (llm-protocol:llm-response-finish-reason r)))
+    (ok (equal "found" (llm-protocol:llm-response-text r)))
+    (let ((call (first (llm-protocol:llm-response-tool-calls r))))
+      (ok (llm-protocol-anthropic:anthropic-tool-call-server-p call))
+      (ok (equal "web_search" (llm-protocol:llm-tool-call-part-name call)))
+      (ok (equal "{\"query\":\"cl\"}"
+                 (llm-protocol:llm-tool-call-part-arguments call))))
+    (ok (find-if #'llm-protocol-anthropic:anthropic-block-part-p
+                 (llm-protocol:llm-response-parts r)))))
+
+(deftest anthropic-compat-rewrites-server-tool-use
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-anthropic :post "http://x/v1/messages" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-anthropic:make-llama-server-anthropic-backend
+        :request-fn #'capture)
+       (list (llm-protocol:user-turn "search")
+             (llm-protocol:assistant-turn
+              nil
+              :tool-calls
+              (list (make-instance 'llm-protocol-anthropic:anthropic-tool-call-part
+                                   :id "srv_1" :name "web_search"
+                                   :arguments "{\"query\":\"cl\"}"
+                                   :server-p t))))
+       :tools (list (llm-protocol-anthropic:make-web-search-tool)))
+      (let* ((asst (elt (gethash "messages" seen) 1))
+             (block (elt (gethash "content" asst) 0)))
+        (ok (equal "assistant" (gethash "role" asst)))
+        (ok (equal "tool_use" (gethash "type" block)))
+        (ok (equal "web_search" (gethash "name" block)))
+        (ng (equal "server_tool_use" (gethash "type" block)))))))
+
+(deftest anthropic-beta-header
+  (let ((seen-headers nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url))
+             (setf seen-headers headers)
+             (%fake-anthropic :post "http://x/v1/messages" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-anthropic:make-anthropic-backend
+        :api-key "sk-test"
+        :betas '("computer-use-2025-01-24" "mcp-client-2025-11-20")
+        :request-fn #'capture)
+       "hi")
+      (ok (equal "computer-use-2025-01-24,mcp-client-2025-11-20"
+                 (cdr (assoc "anthropic-beta" seen-headers :test #'string-equal)))))))
