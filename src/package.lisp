@@ -42,6 +42,7 @@
            #:anthropic-text-citations
            #:anthropic-betas
            #:anthropic-dialect
-           #:+anthropic-native-tools+))
+           #:+anthropic-native-tools+
+           #:encode-image-part))
 
 (in-package #:llm-protocol-anthropic)

@@ -189,6 +189,57 @@
     ((stringp x) x)
     (t (princ-to-string x))))
 
+(defparameter +%b64-alphabet+
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(defun %usb8-p (x)
+  (and (vectorp x)
+       (not (stringp x))
+       (or (zerop (length x))
+           (integerp (aref x 0)))))
+
+(defun %rfc4648-encode (octets)
+  (let* ((octets (coerce octets '(simple-array (unsigned-byte 8) (*))))
+         (n (length octets))
+         (out (make-string (* 4 (ceiling n 3)) :initial-element #\=)))
+    (loop with j = 0
+          for i from 0 below n by 3
+          for b0 = (aref octets i)
+          for b1 = (if (< (1+ i) n) (aref octets (1+ i)) 0)
+          for b2 = (if (< (+ i 2) n) (aref octets (+ i 2)) 0)
+          for triple = (logior (ash b0 16) (ash b1 8) b2)
+          do (setf (char out j) (char +%b64-alphabet+ (ldb (byte 6 18) triple))
+                   (char out (1+ j)) (char +%b64-alphabet+ (ldb (byte 6 12) triple)))
+             (when (< (1+ i) n)
+               (setf (char out (+ j 2))
+                     (char +%b64-alphabet+ (ldb (byte 6 6) triple))))
+             (when (< (+ i 2) n)
+               (setf (char out (+ j 3))
+                     (char +%b64-alphabet+ (ldb (byte 6 0) triple))))
+             (incf j 4))
+    out))
+
+(defun %image-data-base64 (part)
+  (let ((data (llm-image-part-data part)))
+    (cond
+      ((null data) "")
+      ((stringp data) data)
+      ((%usb8-p data) (%rfc4648-encode data))
+      (t (princ-to-string data)))))
+
+(defun encode-image-part (part)
+  "Encode LLM-IMAGE-PART as an Anthropic image content block.
+   URL → {type:image, source:{type:url, url}}
+   data → {type:image, source:{type:base64, media_type, data}}"
+  (check-type part llm-image-part)
+  (%ht "type" "image"
+       "source" (if (llm-image-part-url part)
+                    (%ht "type" "url" "url" (llm-image-part-url part))
+                    (%ht "type" "base64"
+                         "media_type" (or (llm-image-part-media-type part)
+                                          "image/png")
+                         "data" (%image-data-base64 part)))))
+
 (defun %json-args (arguments)
   (cond
     ((null arguments) (%ht))
@@ -223,13 +274,7 @@
     (llm-text-part
      (%ht "type" "text" "text" (or (llm-text-part-text part) "")))
     (llm-image-part
-     (%ht "type" "image"
-          "source" (if (llm-image-part-url part)
-                       (%ht "type" "url" "url" (llm-image-part-url part))
-                       (%ht "type" "base64"
-                            "media_type" (or (llm-image-part-media-type part)
-                                             "image/png")
-                            "data" (or (llm-image-part-data part) "")))))
+     (encode-image-part part))
     (llm-thinking-part
      (let ((h (%ht "type" "thinking"
                    "thinking" (or (llm-thinking-part-text part) ""))))

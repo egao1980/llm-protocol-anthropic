@@ -634,3 +634,45 @@
        "hi")
       (ok (equal "computer-use-2025-01-24,mcp-client-2025-11-20"
                  (cdr (assoc "anthropic-beta" seen-headers :test #'string-equal)))))))
+
+(deftest encode-image-part-url
+  (let* ((h (llm-protocol-anthropic:encode-image-part
+             (llm-protocol:make-llm-image-part :url "https://ex.test/a.png")))
+         (src (gethash "source" h)))
+    (ok (equal "image" (gethash "type" h)))
+    (ok (equal "url" (gethash "type" src)))
+    (ok (equal "https://ex.test/a.png" (gethash "url" src)))))
+
+(deftest encode-image-part-base64-octets
+  (let* ((octets (make-array 3 :element-type '(unsigned-byte 8)
+                             :initial-contents '(1 2 3)))
+         (h (llm-protocol-anthropic:encode-image-part
+             (llm-protocol:make-llm-image-part
+              :data octets :media-type "image/jpeg")))
+         (src (gethash "source" h)))
+    (ok (equal "image" (gethash "type" h)))
+    (ok (equal "base64" (gethash "type" src)))
+    (ok (equal "image/jpeg" (gethash "media_type" src)))
+    (ok (equal "AQID" (gethash "data" src)))))
+
+(deftest anthropic-image-part-on-wire
+  (let ((seen nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url headers))
+             (setf seen (stack-json:decode content))
+             (%fake-anthropic :post "http://x/v1/messages" :content content)))
+      (llm-protocol:generate
+       (llm-protocol-anthropic:make-anthropic-backend :request-fn #'capture)
+       (llm-protocol:make-llm-turn
+        :role :user
+        :parts (list (llm-protocol:make-llm-text-part :text "see")
+                     (llm-protocol:make-llm-image-part
+                      :url "https://ex.test/a.png"))))
+      (let* ((msgs (gethash "messages" seen))
+             (content (gethash "content" (elt msgs 0)))
+             (img (elt content 1)))
+        (ok (vectorp content))
+        (ok (equal "image" (gethash "type" img)))
+        (ok (equal "url" (gethash "type" (gethash "source" img))))
+        (ok (equal "https://ex.test/a.png"
+                   (gethash "url" (gethash "source" img))))))))
