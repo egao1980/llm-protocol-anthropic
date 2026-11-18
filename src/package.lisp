@@ -42,6 +42,8 @@
            #:anthropic-text-citations
            #:anthropic-betas
            #:anthropic-dialect
+           #:anthropic-prompt-cache
+           #:anthropic-server-compaction
            #:+anthropic-native-tools+
            #:encode-image-part))
 

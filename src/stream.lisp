@@ -55,12 +55,12 @@
     (funcall on-part part)))
 
 (defun %stream-body (backend path object)
-  (multiple-value-bind (status body)
+  (multiple-value-bind (status body retry-after)
       (%request backend :post path object
                 :want-stream t
                 :accept "text/event-stream")
     (unless (<= 200 status 299)
-      (%decode status (%coerce-body-string body)))
+      (%decode status (%coerce-body-string body) retry-after))
     body))
 
 (defun %ensure-tool (table index)
@@ -134,7 +134,8 @@
                            (setf (gethash idx tools) acc)))
                         ((or (%server-result-type-p btype)
                              (string-equal btype "document")
-                             (string-equal btype "container_upload"))
+                             (string-equal btype "container_upload")
+                             (string-equal btype "compaction"))
                          (setf (gethash idx blocks) block)))))))
                ((string-equal type "content_block_delta")
                 (let* ((idx (or (gethash "index" obj) 0))
@@ -153,6 +154,12 @@
                              (write-string tx thinking)
                              (%emit-part on-part
                                          (make-llm-thinking-part :text tx)))))
+                        ((string-equal dtype "compaction_delta")
+                         ;; One delta carries the whole summary.
+                         (let ((block (gethash idx blocks)))
+                           (when (hash-table-p block)
+                             (setf (gethash "content" block)
+                                   (gethash "content" delta)))))
                         ((string-equal dtype "signature_delta")
                          (setf signature (%str (gethash "signature" delta))))
                         ((string-equal dtype "input_json_delta")
@@ -168,11 +175,16 @@
                     (when (gethash "stop_reason" delta)
                       (setf finish (%finish-reason (gethash "stop_reason" delta)))))
                   (when (gethash "usage" obj)
-                    (setf usage (%usage (gethash "usage" obj))))))
+                    (setf usage (%merge-usage usage (%usage (gethash "usage" obj)))))))
                ((string-equal type "error")
-                (error 'llm-http-error
-                       :retryable-p nil
-                       :message (%error-message obj "stream error")))))))))
+                (let* ((err (gethash "error" obj))
+                       (etype (and (hash-table-p err) (gethash "type" err)))
+                       (overloaded (equal etype "overloaded_error")))
+                  ;; Mid-stream overload is the API's 529: retry the step.
+                  (error 'llm-http-error
+                         :status (and overloaded 529)
+                         :retryable-p overloaded
+                         :message (%error-message obj "stream error"))))))))))
     (let* ((think-s (get-output-stream-string thinking))
            (text-s (get-output-stream-string text))
            (keys (sort (delete-duplicates
@@ -204,5 +216,6 @@
   (multiple-value-bind (model body)
       (%messages-body backend turns :model model :settings settings
                       :tools tools :tool-choice tool-choice :stream t)
-    (%consume-messages-sse (%stream-body backend "/messages" body)
+    (%consume-messages-sse (let ((*request-betas* (%body-betas body)))
+                             (%stream-body backend "/messages" body))
                            on-part model)))

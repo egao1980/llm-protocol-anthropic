@@ -132,10 +132,21 @@
                  "message_stop")
      s)))
 
+(defun %block-text (content)
+  "Text of CONTENT: a string, or the first text block of a block vector
+(prompt-cache breakpoints turn a string into one text block)."
+  (cond
+    ((stringp content) content)
+    ((and (vectorp content) (plusp (length content))
+          (hash-table-p (elt content 0))
+          (equal "text" (gethash "type" (elt content 0))))
+     (gethash "text" (elt content 0)))
+    (t content)))
+
 (defun %last-user-content (body)
   (let ((msgs (gethash "messages" body)))
     (when (and msgs (plusp (length msgs)))
-      (gethash "content" (elt msgs (1- (length msgs)))))))
+      (%block-text (gethash "content" (elt msgs (1- (length msgs))))))))
 
 (defun %fake-anthropic (method url &key headers content want-stream)
   (declare (ignore headers))
@@ -227,7 +238,7 @@
        (list (llm-protocol:system-turn "be brief")
              (llm-protocol:user-turn "hi"))
        :settings '(:temperature 0 :max-tokens 16))
-      (ok (equal "be brief" (gethash "system" seen)))
+      (ok (equal "be brief" (%block-text (gethash "system" seen))))
       (ok (zerop (gethash "temperature" seen)))
       (ok (= 16 (gethash "max_tokens" seen)))
       (ok (equal "sk-test" (cdr (assoc "x-api-key" seen-headers :test #'string-equal))))
@@ -676,3 +687,185 @@
         (ok (equal "url" (gethash "type" (gethash "source" img))))
         (ok (equal "https://ex.test/a.png"
                    (gethash "url" (gethash "source" img))))))))
+
+(defun %capture-body (backend turns &rest args)
+  (let ((seen nil))
+    (setf (llm-protocol-anthropic::anthropic-request-fn backend)
+          (lambda (method url &key content &allow-other-keys)
+            (declare (ignore method url))
+            (setf seen (stack-json:decode content))
+            (%fake-anthropic :post "http://x/v1/messages" :content content)))
+    (apply #'llm-protocol:generate backend turns args)
+    seen))
+
+(defun %cached-p (h)
+  (and (hash-table-p h) (hash-table-p (gethash "cache_control" h))
+       (equal "ephemeral" (gethash "type" (gethash "cache_control" h)))))
+
+(defun %last-block (content)
+  (and (vectorp content) (plusp (length content))
+       (elt content (1- (length content)))))
+
+(deftest anthropic-prompt-cache-breakpoints
+  (let* ((turns (list (llm-protocol:system-turn "be brief")
+                      (llm-protocol:user-turn "one")
+                      (llm-protocol:assistant-turn "two")
+                      (llm-protocol:user-turn "three")))
+         (tools (list (llm-protocol:make-llm-tool :name "a" :description "A")
+                      (llm-protocol:make-llm-tool :name "b" :description "B")))
+         (body (%capture-body (llm-protocol-anthropic:make-anthropic-backend)
+                              turns :tools tools))
+         (msgs (gethash "messages" body)))
+    (testing "last tool, system and the last two messages carry cache_control"
+      (ok (%cached-p (elt (gethash "tools" body) 1)))
+      (ng (%cached-p (elt (gethash "tools" body) 0)))
+      (ok (%cached-p (%last-block (gethash "system" body))))
+      (ok (equal "be brief" (%block-text (gethash "system" body))))
+      (ok (= 3 (length msgs)))
+      (ok (equal "one" (gethash "content" (elt msgs 0))))
+      (ok (%cached-p (%last-block (gethash "content" (elt msgs 1)))))
+      (ok (%cached-p (%last-block (gethash "content" (elt msgs 2)))))
+      (ng (gethash "prompt_cache" body))))
+  (testing "settings extra :prompt-cache nil and the compat dialect leave the wire alone"
+    (let ((body (%capture-body (llm-protocol-anthropic:make-anthropic-backend)
+                               (list (llm-protocol:system-turn "s")
+                                     (llm-protocol:user-turn "u"))
+                               :settings '(:extra (:prompt-cache nil)))))
+      (ok (equal "s" (gethash "system" body)))
+      (ng (gethash "prompt_cache" body)))
+    (let ((body (%capture-body (llm-protocol-anthropic:make-anthropic-backend
+                                :dialect :compat)
+                               (list (llm-protocol:system-turn "s")
+                                     (llm-protocol:user-turn "u")))))
+      (ok (equal "s" (gethash "system" body)))
+      (ok (equal "u" (gethash "content" (elt (gethash "messages" body) 0)))))))
+
+(deftest anthropic-cache-usage-and-stream-usage-merge
+  (let ((usage (llm-protocol-anthropic::%usage
+                (%ht "input_tokens" 5 "output_tokens" 7
+                     "cache_read_input_tokens" 1000
+                     "cache_creation_input_tokens" 200))))
+    (ok (= 1000 (llm-protocol:llm-usage-cache-read-tokens usage)))
+    (ok (= 200 (llm-protocol:llm-usage-cache-write-tokens usage)))
+    (ok (= 1205 (llm-protocol:llm-usage-prompt-tokens usage))))
+  ;; message_start has input_tokens 3, message_delta only output_tokens 2.
+  (let ((r (llm-protocol:stream-generate
+            (llm-protocol-anthropic:make-anthropic-backend :request-fn #'%fake-anthropic)
+            "hi")))
+    (ok (= 3 (llm-protocol:llm-usage-input-tokens (llm-protocol:llm-response-usage r))))
+    (ok (= 2 (llm-protocol:llm-usage-output-tokens (llm-protocol:llm-response-usage r))))))
+
+(deftest anthropic-overflow-and-retry-after
+  (flet ((backend (status body &optional retry-after)
+           (llm-protocol-anthropic:make-anthropic-backend
+            :request-fn (lambda (method url &key &allow-other-keys)
+                          (declare (ignore method url))
+                          (values status body retry-after)))))
+    (ok (signals (llm-protocol:generate
+                  (backend 400 "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 250000 tokens > 200000 maximum\"}}")
+                  "hi")
+                 'llm-protocol:llm-context-overflow))
+    (let ((c (handler-case (llm-protocol:generate
+                            (backend 429 "{\"error\":{\"message\":\"slow down\"}}" 12)
+                            "hi")
+               (llm-protocol:llm-http-error (e) e))))
+      (ok (= 12 (llm-protocol:llm-http-error-retry-after c)))
+      (ok (eq :rate-limit (llm-protocol:llm-retry-class c))))
+    (ok (eq :overloaded
+            (llm-protocol:llm-retry-class
+             (handler-case (llm-protocol:generate
+                            (backend 529 "{\"error\":{\"type\":\"overloaded_error\"}}")
+                            "hi")
+               (llm-protocol:llm-http-error (e) e)))))
+    (ok (= 7 (llm-protocol-anthropic::%retry-after "7")))
+    (ng (llm-protocol-anthropic::%retry-after "Wed, 21 Oct 2015 07:28:00 GMT"))))
+
+(deftest anthropic-server-compaction
+  (let ((seen nil) (seen-headers nil))
+    (flet ((capture (method url &key headers content &allow-other-keys)
+             (declare (ignore method url))
+             (setf seen (stack-json:decode content) seen-headers headers)
+             (values 200
+                     (stack-json:encode
+                      (%ht "id" "msg_c" "model" "m" "stop_reason" "end_turn"
+                           "usage" (%ht "input_tokens" 10 "output_tokens" 2
+                                        "iterations"
+                                        (vector (%ht "type" "compaction"
+                                                     "input_tokens" 100
+                                                     "output_tokens" 20)
+                                                (%ht "type" "message"
+                                                     "input_tokens" 10
+                                                     "output_tokens" 2)))
+                           "content" (vector (%ht "type" "compaction"
+                                                  "content" "SUMMARY")
+                                             (%ht "type" "text" "text" "ok")))))))
+      (let* ((b (llm-protocol-anthropic:make-anthropic-backend
+                 :request-fn #'capture :betas '("other-beta")
+                 :server-compaction '(:trigger 60000 :instructions "keep paths")))
+             (r (llm-protocol:generate b "hi"))
+             (edit (elt (gethash "edits" (gethash "context_management" seen)) 0))
+             (block (find-if #'llm-protocol:compaction-part-p
+                             (llm-protocol:llm-response-parts r))))
+        (testing "request carries the edit and the beta"
+          (ok (equal "compact_20260112" (gethash "type" edit)))
+          (ok (= 60000 (gethash "value" (gethash "trigger" edit))))
+          (ok (equal "keep paths" (gethash "instructions" edit)))
+          (ng (gethash "server_compaction" seen))
+          (ok (equal "other-beta,compact-2026-01-12"
+                     (cdr (assoc "anthropic-beta" seen-headers :test #'string-equal)))))
+        (testing "the compaction block is a part, billed tokens include it"
+          (ok block)
+          (ok (equal "ok" (llm-protocol:llm-response-text r)))
+          (ok (= 132 (llm-protocol:llm-usage-total-tokens
+                      (llm-protocol:llm-response-usage r)))))
+        (testing "the block goes back verbatim on the next request"
+          (llm-protocol:generate
+           b (list (llm-protocol:user-turn "hi")
+                   (llm-protocol:make-llm-turn :role :assistant
+                                               :parts (llm-protocol:llm-response-parts r))
+                   (llm-protocol:user-turn "more")))
+          (let ((content (gethash "content" (elt (gethash "messages" seen) 1))))
+            (ok (equal "compaction" (gethash "type" (elt content 0))))
+            (ok (equal "SUMMARY" (gethash "content" (elt content 0))))))
+        (testing "off by default and NIL per call"
+          (llm-protocol:generate b "hi" :settings '(:extra (:server-compaction nil)))
+          (ng (gethash "context_management" seen))
+          (ok (equal "other-beta"
+                     (cdr (assoc "anthropic-beta" seen-headers :test #'string-equal)))))
+        (ok (signals (llm-protocol:generate b "hi" :settings '(:extra (:server-compaction 10)))
+                     'type-error))))))
+
+(deftest anthropic-stream-compaction-block
+  (flet ((sse (method url &key &allow-other-keys)
+           (declare (ignore method url))
+           (values 200
+                   (concatenate
+                    'string
+                    (%sse-block (stack-json:encode
+                                 (%ht "type" "message_start"
+                                      "message" (%ht "id" "m1" "usage" (%ht "input_tokens" 4))))
+                                "message_start")
+                    (%sse-block (stack-json:encode
+                                 (%ht "type" "content_block_start" "index" 0
+                                      "content_block" (%ht "type" "compaction")))
+                                "content_block_start")
+                    (%sse-block (stack-json:encode
+                                 (%ht "type" "content_block_delta" "index" 0
+                                      "delta" (%ht "type" "compaction_delta"
+                                                   "content" "SUM")))
+                                "content_block_delta")
+                    (%sse-block (stack-json:encode (%ht "type" "content_block_stop" "index" 0))
+                                "content_block_stop")
+                    (%sse-block (stack-json:encode
+                                 (%ht "type" "message_delta"
+                                      "delta" (%ht "stop_reason" "end_turn")
+                                      "usage" (%ht "output_tokens" 1)))
+                                "message_delta")
+                    (%sse-block (stack-json:encode (%ht "type" "message_stop"))
+                                "message_stop")))))
+    (let* ((r (llm-protocol:stream-generate
+               (llm-protocol-anthropic:make-anthropic-backend :request-fn #'sse) "hi"))
+           (part (find-if #'llm-protocol:compaction-part-p (llm-protocol:llm-response-parts r))))
+      (ok part)
+      (ok (equal "SUM" (gethash "content"
+                                (llm-protocol-anthropic::anthropic-block-part-block part)))))))

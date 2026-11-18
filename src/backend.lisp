@@ -26,11 +26,26 @@
             :initform +default-anthropic-version+)
    (betas :initarg :betas :accessor anthropic-betas :initform nil)
    (dialect :initarg :dialect :accessor anthropic-dialect :initform :official)
-   (request-fn :initarg :request-fn :accessor anthropic-request-fn :initform nil)))
+   (request-fn :initarg :request-fn :accessor anthropic-request-fn :initform nil
+               :documentation "(method url &key headers content want-stream) ->
+(values status body [retry-after-seconds]).")
+   (server-compaction :initarg :server-compaction
+                      :accessor anthropic-server-compaction :initform nil
+                      :documentation "API-side compaction (beta compact-2026-01-12):
+NIL, T (API default trigger), an integer trigger in input tokens (>= 50000),
+or a plist (:trigger n :instructions s :pause-after-compaction b).
+Per call: settings extra :server-compaction.")
+   (prompt-cache :initarg :prompt-cache :accessor anthropic-prompt-cache
+                 :initform :auto
+                 :documentation "Mark prompt-cache breakpoints: T, NIL, or :AUTO
+(only for the :official dialect). Per call: settings extra :prompt-cache.")))
 
 (defun make-anthropic-backend (&key base-url api-key default-model version
-                                 betas dialect request-fn)
+                                 betas dialect request-fn (prompt-cache :auto)
+                                 server-compaction)
   (make-instance 'anthropic-backend
+                 :server-compaction server-compaction
+                 :prompt-cache prompt-cache
                  :base-url (or base-url (%env "ANTHROPIC_BASE_URL")
                                +default-anthropic-base-url+)
                  :api-key (or api-key (%env "ANTHROPIC_API_KEY")
@@ -100,6 +115,10 @@
 (defun %join (base path)
   (format nil "~a~a" (string-right-trim "/" (or base "")) path))
 
+(defvar *request-betas* nil
+  "Beta names the request body needs (bound around one request by GENERATE /
+STREAM-GENERATE from %BODY-BETAS), merged into anthropic-beta.")
+
 (defun %headers (backend &key (accept "application/json"))
   (let ((h `(("content-type" . "application/json")
              ("accept" . ,accept)
@@ -111,7 +130,12 @@
       (push (cons "authorization"
                   (format nil "Bearer ~a" (anthropic-api-key backend)))
             h))
-    (let ((betas (anthropic-betas backend)))
+    (let ((betas (remove-duplicates
+                  (append (if (stringp (anthropic-betas backend))
+                              (list (anthropic-betas backend))
+                              (llm-protocol::%as-list (anthropic-betas backend)))
+                          *request-betas*)
+                  :test #'equal :from-end t)))
       (when betas
         (push (cons "anthropic-beta"
                     (if (stringp betas)
@@ -128,6 +152,12 @@
        (babel:octets-to-string b :encoding :utf-8))
       (t ""))))
 
+(defun %retry-after (value)
+  "Seconds from a Retry-After header value; NIL for an HTTP date or junk."
+  (when (stringp value)
+    (let ((n (parse-integer value :junk-allowed t)))
+      (and (integerp n) (<= 0 n) n))))
+
 (defun %http-request (method url &key headers content want-stream)
   (unless http-protocol:*http-backend*
     (error 'llm-error
@@ -140,7 +170,8 @@
     (values (http-protocol:response-status res)
             (if want-stream
                 (http-protocol:response-body res)
-                (%body-string res)))))
+                (%body-string res))
+            (%retry-after (http-protocol:response-header res "retry-after")))))
 
 (defun %request (backend method path &optional object &key want-stream accept)
   (let* ((fn (or (anthropic-request-fn backend) #'%http-request))
@@ -151,10 +182,10 @@
                                         (if want-stream
                                             "text/event-stream"
                                             "application/json")))))
-    (multiple-value-bind (status body)
+    (multiple-value-bind (status body retry-after)
         (funcall fn method url :headers headers :content content
                  :want-stream want-stream)
-      (values status body))))
+      (values status body retry-after))))
 
 (defun %error-message (obj fallback)
   (cond
@@ -165,17 +196,24 @@
        (if (stringp err) err (princ-to-string err))))
     (t fallback)))
 
-(defun %decode (status body)
+(defun %decode (status body &optional retry-after)
   (let ((obj (ignore-errors (stack-json:decode body))))
     (cond
       ((<= 200 status 299) (or obj (error 'llm-error :message "empty JSON body")))
       (t
        (restart-case
-           (error 'llm-http-error
-                  :status status
-                  :body body
-                  :retryable-p (http-status-retryable-p status)
-                  :message (%error-message obj (format nil "HTTP ~a" status)))
+           (let ((message (%error-message obj (format nil "HTTP ~a" status))))
+             (if (and (member status '(400 413))
+                      (or (context-overflow-text-p message)
+                          (context-overflow-text-p body)))
+                 (error 'llm-context-overflow
+                        :status status :body body :message message)
+                 (error 'llm-http-error
+                        :status status
+                        :body body
+                        :retry-after retry-after
+                        :retryable-p (http-status-retryable-p status)
+                        :message message)))
          (retry ()
            :report "Retry the HTTP request"
            (llm-protocol::%invoke-retry))
@@ -373,7 +411,10 @@
                (let ((key (if (stringp k)
                               k
                               (substitute #\_ #\- (string-downcase (symbol-name k))))))
-                 (unless (nth-value 1 (gethash key body))
+                 ;; :prompt-cache is ours (breakpoints), not a wire field.
+                 (unless (or (nth-value 1 (gethash key body))
+                             (member key '("prompt_cache" "server_compaction")
+                                     :test #'equal))
                    (setf (gethash key body)
                          (if (keywordp v)
                              (string-downcase (symbol-name v))
@@ -385,6 +426,147 @@
            (loop for (k v) on extra by #'cddr
                  do (put k v))))))
     body))
+
+;;; --- prompt cache ----------------------------------------------------------
+;;; Breakpoints on the last tool, the system prompt and the last two messages
+;;; (4 = the API maximum). The prefix up to each one is cached, so a long agent
+;;; run re-reads tools + system + history from cache instead of paying again.
+
+(defun %settings-extra-get (settings key)
+  "→ (values value found-p) for KEY in SETTINGS extra (plist or hash table)."
+  (let ((extra (and settings (llm-settings-extra settings))))
+    (cond
+      ((hash-table-p extra)
+       (multiple-value-bind (v found)
+           (gethash (substitute #\_ #\- (string-downcase (symbol-name key))) extra)
+         (if found (values v t) (gethash key extra))))
+      ((consp extra)
+       (loop for (k v) on extra by #'cddr
+             when (and (symbolp k) (string= (symbol-name k) (symbol-name key)))
+               return (values v t))))))
+
+(defun %prompt-cache-p (backend settings)
+  (multiple-value-bind (v found) (%settings-extra-get settings :prompt-cache)
+    (let ((mode (if found v (anthropic-prompt-cache backend))))
+      (if (eq mode :auto)
+          (eq (or (anthropic-dialect backend) :official) :official)
+          (and mode t)))))
+
+(defun %ephemeral ()
+  (%ht "type" "ephemeral"))
+
+(defun %copy-ht (h)
+  (let ((new (make-hash-table :test (hash-table-test h))))
+    (maphash (lambda (k v) (setf (gethash k new) v)) h)
+    new))
+
+(defun %cacheable-block-p (b)
+  (and (hash-table-p b)
+       (not (member (gethash "type" b) '("thinking" "redacted_thinking")
+                    :test #'equal))))
+
+(defun %cache-content (content)
+  "CONTENT (string or block vector) with cache_control on its last cacheable
+block, or NIL when there is none. Never mutates the caller's blocks."
+  (cond
+    ((and (stringp content) (plusp (length content)))
+     (vector (%ht "type" "text" "text" content "cache_control" (%ephemeral))))
+    ((and (vectorp content) (not (stringp content)))
+     (let ((i (position-if #'%cacheable-block-p content :from-end t)))
+       (when i
+         (let ((copy (copy-seq content))
+               (b (%copy-ht (aref content i))))
+           (setf (gethash "cache_control" b) (%ephemeral)
+                 (aref copy i) b)
+           copy))))))
+
+(defun %mark-cache-breakpoints (body)
+  "Put cache_control on the last tool, the system prompt and the last two
+messages of BODY. Copies what it changes."
+  (let ((tools (gethash "tools" body))
+        (system (gethash "system" body))
+        (messages (gethash "messages" body)))
+    (when (and (vectorp tools) (plusp (length tools))
+               (hash-table-p (aref tools (1- (length tools)))))
+      (let ((copy (copy-seq tools))
+            (last (%copy-ht (aref tools (1- (length tools))))))
+        (setf (gethash "cache_control" last) (%ephemeral)
+              (aref copy (1- (length copy))) last
+              (gethash "tools" body) copy)))
+    (when (stringp system)
+      (let ((c (%cache-content system)))
+        (when c (setf (gethash "system" body) c))))
+    (when (vectorp messages)
+      (let ((copy (copy-seq messages))
+            (marked 0))
+        (loop for i from (1- (length copy)) downto 0
+              while (< marked 2)
+              do (let* ((m (aref copy i))
+                        (c (and (hash-table-p m)
+                                (%cache-content (gethash "content" m)))))
+                   (when c
+                     (let ((nm (%copy-ht m)))
+                       (setf (gethash "content" nm) c
+                             (aref copy i) nm)
+                       (incf marked)))))
+        (setf (gethash "messages" body) copy)))
+    body))
+
+;;; --- API-side compaction ---------------------------------------------------
+;;; The API summarizes earlier turns into a `compaction` block once the prompt
+;;; crosses the trigger. The block comes back as an ANTHROPIC-BLOCK-PART and is
+;;; sent back verbatim; the API drops everything before it.
+
+(defun %compaction-edit (spec)
+  (let ((edit (%ht "type" "compact_20260112")))
+    (flet ((trigger (n)
+             (check-type n (integer 50000 *))
+             (setf (gethash "trigger" edit) (%ht "type" "input_tokens" "value" n))))
+      (cond
+        ((eq spec t))
+        ((integerp spec) (trigger spec))
+        ((consp spec)
+         (destructuring-bind (&key trigger instructions pause-after-compaction) spec
+           (when trigger (trigger trigger))
+           (when instructions
+             (setf (gethash "instructions" edit) instructions))
+           (when pause-after-compaction
+             (setf (gethash "pause_after_compaction" edit) t))))
+        (t (error 'llm-error
+                  :message (format nil "bad :server-compaction ~s" spec)))))
+    edit))
+
+(defun %apply-server-compaction (backend settings body)
+  "Add a compact_20260112 edit unless the caller set context_management."
+  (multiple-value-bind (v found) (%settings-extra-get settings :server-compaction)
+    (let ((spec (if found v (anthropic-server-compaction backend))))
+      (when (and spec (not (nth-value 1 (gethash "context_management" body))))
+        (setf (gethash "context_management" body)
+              (%ht "edits" (vector (%compaction-edit spec)))))))
+  body)
+
+(defun %body-betas (body)
+  "Beta names BODY's context_management edits need."
+  (let ((cm (gethash "context_management" body))
+        (betas '()))
+    (when (hash-table-p cm)
+      (loop for edit across (coerce (or (gethash "edits" cm) #()) 'vector)
+            for type = (and (hash-table-p edit) (gethash "type" edit))
+            do (cond
+                 ((equal type "compact_20260112")
+                  (pushnew "compact-2026-01-12" betas :test #'equal))
+                 ((and (stringp type)
+                       (or (search "clear_tool_uses" type)
+                           (search "clear_thinking" type)))
+                  (pushnew "context-management-2025-06-27" betas :test #'equal)))))
+    (nreverse betas)))
+
+(defmethod compaction-part-p ((part anthropic-block-part))
+  (let ((b (anthropic-block-part-block part)))
+    (and (hash-table-p b)
+         (equal "compaction" (gethash "type" b))
+         (stringp (gethash "content" b))
+         t)))
 
 (defun %messages-body (backend turns &key model settings tools tool-choice stream)
   (let* ((*anthropic-dialect* (or (anthropic-dialect backend) :official))
@@ -405,6 +587,9 @@
                        "tool_choice" (%wire-tool-choice tool-choice)
                        "stream" (if stream t :omit))))
         (%apply-settings-extra body settings)
+        (%apply-server-compaction backend settings body)
+        (when (%prompt-cache-p backend settings)
+          (%mark-cache-breakpoints body))
         (values model body)))))
 
 (defun %finish-reason (raw)
@@ -413,15 +598,53 @@
     ((or (string-equal raw "end_turn") (string-equal raw "stop_sequence")) :stop)
     ((string-equal raw "max_tokens") :length)
     ((string-equal raw "tool_use") :tool-use)
+    ((string-equal raw "compaction") :compaction)
     ((or (string-equal raw "pause_turn") (string-equal raw "refusal")) :stop)
     (t :stop)))
 
 (defun %usage (obj)
   (when (hash-table-p obj)
-    (let ((in (or (gethash "input_tokens" obj) 0))
-          (out (or (gethash "output_tokens" obj) 0)))
-      (make-llm-usage :input-tokens in :output-tokens out
-                      :total-tokens (+ in out)))))
+    (flet ((n (key)
+             (let ((v (gethash key obj)))
+               (and (integerp v) v))))
+      (let ((in (or (n "input_tokens") 0))
+            (out (or (n "output_tokens") 0))
+            (read (n "cache_read_input_tokens"))
+            (write (n "cache_creation_input_tokens")))
+        (make-llm-usage :input-tokens in :output-tokens out
+                        :cache-read-tokens read :cache-write-tokens write
+                        ;; Billed total: compaction iterations are not in the
+                        ;; top-level counts.
+                        :total-tokens (+ in out (or read 0) (or write 0)
+                                         (%compaction-iteration-tokens obj)))))))
+
+(defun %compaction-iteration-tokens (usage)
+  (let ((its (gethash "iterations" usage)))
+    (if (vectorp its)
+        (loop for it across its
+              when (and (hash-table-p it) (equal "compaction" (gethash "type" it)))
+                sum (+ (or (gethash "input_tokens" it) 0)
+                       (or (gethash "output_tokens" it) 0)))
+        0)))
+
+(defun %merge-usage (start delta)
+  "message_start reports the prompt; message_delta the final output count.
+Keep START's prompt counts where DELTA leaves them out."
+  (cond
+    ((null delta) start)
+    ((null start) delta)
+    (t
+     (flet ((pick (reader)
+              (let ((d (funcall reader delta)))
+                (if (and d (plusp d)) d (funcall reader start)))))
+       (let ((in (pick #'llm-usage-input-tokens))
+             (out (pick #'llm-usage-output-tokens))
+             (read (pick #'llm-usage-cache-read-tokens))
+             (write (pick #'llm-usage-cache-write-tokens)))
+         (make-llm-usage :input-tokens in :output-tokens out
+                         :cache-read-tokens read :cache-write-tokens write
+                         :total-tokens (+ (or in 0) (or out 0)
+                                          (or read 0) (or write 0))))))))
 
 (defun %tool-call-extras (block)
   (let ((extras nil))
@@ -485,9 +708,10 @@
   (multiple-value-bind (model body)
       (%messages-body backend turns :model model :settings settings
                       :tools tools :tool-choice tool-choice)
-    (multiple-value-bind (status text)
-        (%request backend :post "/messages" body)
-      (%parse-message (%decode status text) model))))
+    (multiple-value-bind (status text retry-after)
+        (let ((*request-betas* (%body-betas body)))
+          (%request backend :post "/messages" body))
+      (%parse-message (%decode status text retry-after) model))))
 
 (defmethod list-models ((backend anthropic-backend) &key)
   (handler-bind ((llm-http-error
