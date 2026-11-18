@@ -33,6 +33,12 @@ Native tools (`make-web-search-tool`, `:bash`, …): official wire uses Anthropi
 
 System turns → top-level `system`. Tool turns → user `tool_result` blocks. Thinking + `signature` round-trip on `llm-thinking-part`. `tool_choice`: `:auto` / `:none` / `:required` → `any` / string → `{type:tool,name}`. `list-models` `GET /models`; **404 → default model**. `backend-supports-p`: `:tools` `:stream` `:vision` `:thinking` + `:native-tools` (official). No `:embeddings`. Default `respond` = items→turns→`generate`.
 
+**Prompt cache.** On by default for the official API (`:prompt-cache :auto`; `t` / `nil` force it; per call settings `:extra (:prompt-cache nil)`). Each request marks 4 breakpoints — the last tool, the system prompt and the last two messages — so a long agent run re-reads tools, system and history from cache. Thinking blocks are never marked; the caller's blocks are copied, not mutated. `llm-usage` reports `cache-read-tokens` / `cache-write-tokens`.
+
+**API-side compaction** (beta `compact-2026-01-12`): `:server-compaction` on the backend or per call — `t` (API default trigger, 150K input tokens), an integer trigger (≥ 50000), or `(:trigger n :instructions "…" :pause-after-compaction t)`. The request gets a `compact_20260112` edit plus the beta header (`*request-betas*`; any `context_management` you pass in `:extra` gets its beta too). The `compaction` block comes back as an `anthropic-block-part` (`compaction-part-p` is true), is sent back verbatim, and `llm-usage-total-tokens` includes the compaction iteration. Streaming handles `compaction_delta`. Stop reason `compaction` → finish `:compaction`.
+
+**Errors.** `400`/`413` "prompt is too long" → `llm-context-overflow`. `Retry-After` reaches `llm-http-error-retry-after` (a `request-fn` may return it as a third value). A mid-stream `overloaded_error` is a retryable 529.
+
 Register in the protocol catalog (llm-protocol **0.2.1**):
 
 ```lisp

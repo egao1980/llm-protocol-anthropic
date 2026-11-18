@@ -1,9 +1,9 @@
 (defsystem "llm-protocol-anthropic"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "Anthropic Messages API backend for llm-protocol (official + vLLM / llama-server)"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("llm-protocol" "http-protocol" "json-protocol" "json-backend-jzon"
+  :depends-on ((:version "llm-protocol" "0.4.0") "http-protocol" "json-protocol" "json-backend-jzon"
                "sse-protocol" "babel")
   :properties
   (:cl-repo
