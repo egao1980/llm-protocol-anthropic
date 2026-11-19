@@ -869,3 +869,130 @@
       (ok part)
       (ok (equal "SUM" (gethash "content"
                                 (llm-protocol-anthropic::anthropic-block-part-block part)))))))
+
+;;; --- compaction on demand (compact-2026-09-04) --------------------------------
+
+(defun %compacting-backend (log &key (stop "compaction") (summary "SUMMARY")
+                                  server-compaction)
+  "Backend whose request-fn pushes (body . headers) onto LOG's car and answers
+a compaction request with a signed block (or, with SUMMARY NIL, nothing)."
+  (llm-protocol-anthropic:make-anthropic-backend
+   :server-compaction server-compaction
+   :request-fn (lambda (method url &key headers content &allow-other-keys)
+                 (declare (ignore method url))
+                 (let ((body (stack-json:decode content)))
+                   (push (cons body headers) (car log))
+                   (values 200
+                           (stack-json:encode
+                            (if (gethash "compaction" body)
+                                (%ht "id" "msg_s" "model" "m" "stop_reason" stop
+                                     "usage" (%ht "input_tokens" 0 "output_tokens" 0)
+                                     "content" (if summary
+                                                   (vector (%ht "type" "compaction"
+                                                                "content" summary
+                                                                "signature" "sig-1"))
+                                                   (vector)))
+                                (%ht "id" "msg_r" "model" "m" "stop_reason" "end_turn"
+                                     "usage" (%ht "input_tokens" 5 "output_tokens" 1)
+                                     "content" (vector (%ht "type" "text" "text" "ok"))))))))))
+
+(defun %beta-header (headers)
+  (cdr (assoc "anthropic-beta" headers :test #'string-equal)))
+
+(defun %chat ()
+  (list (llm-protocol:system-turn "be brief")
+        (llm-protocol:user-turn "q1")
+        (llm-protocol:assistant-turn "a1")
+        (llm-protocol:user-turn "q2")))
+
+(deftest anthropic-compaction-on-demand
+  (let* ((log (list nil))
+         (b (%compacting-backend log :server-compaction 60000)))
+    (ok (llm-protocol:backend-supports-p b :compaction))
+    (ng (llm-protocol:backend-supports-p
+         (llm-protocol-anthropic:make-vllm-anthropic-backend :base-url "http://x")
+         :compaction)
+        "compat dialects have no compaction")
+    (multiple-value-bind (turns did response)
+        (llm-protocol:server-compact b (%chat) :instructions "keep names")
+      (destructuring-bind (body . headers) (first (car log))
+        (testing "the summarize request"
+          (ok (equal "summarize" (gethash "type" (gethash "compaction" body))))
+          (ok (equal "keep names" (gethash "instructions" (gethash "compaction" body))))
+          (ng (gethash "context_management" body)
+              "threshold compaction is not combined with it")
+          (ok (let ((system (gethash "system" body)))
+                ;; A string, or text blocks once prompt-cache marks it.
+                (if (stringp system)
+                    (equal "be brief" system)
+                    (some (lambda (b) (equal "be brief" (gethash "text" b)))
+                          (coerce system 'list))))
+              "same system prompt")
+          (ok (search "compact-2026-09-04" (%beta-header headers)))))
+      (testing "→ the system turn, then the signed block"
+        (ok did)
+        (ok (eq :compaction (llm-protocol:llm-response-finish-reason response)))
+        (ok (= 2 (length turns)))
+        (ok (eq :system (llm-protocol:llm-turn-role (first turns))))
+        (let ((part (first (llm-protocol:llm-turn-parts (second turns)))))
+          (ok (llm-protocol:compaction-part-p part))
+          (ok (equal "SUMMARY" (llm-protocol:compaction-part-text part)))))
+      (testing "the next request opens with the block, byte for byte, with the beta"
+        (llm-protocol:generate b (append turns (list (llm-protocol:user-turn "q3"))))
+        (destructuring-bind (body . headers) (first (car log))
+          (let* ((first-msg (elt (gethash "messages" body) 0))
+                 (block (elt (gethash "content" first-msg) 0)))
+            (ok (equal "assistant" (gethash "role" first-msg)))
+            (ok (equal "compaction" (gethash "type" block)))
+            (ok (equal "sig-1" (gethash "signature" block)))
+            (ok (equal "SUMMARY" (gethash "content" block))))
+          (ok (search "compact-2026-09-04" (%beta-header headers)))
+          (ng (gethash "context_management" body)
+              "no threshold edit next to a signed block")))
+      (testing "the block survives part state (journals)"
+        (let* ((part (first (llm-protocol:llm-turn-parts (second turns))))
+               (back (llm-protocol:part-from-state (llm-protocol:part-state part))))
+          (ok (llm-protocol:compaction-part-p back))
+          (ok (equal "sig-1" (gethash "signature"
+                                      (llm-protocol-anthropic:anthropic-block-part-block
+                                       back)))))))))
+
+(deftest anthropic-compaction-without-a-summary
+  (let ((log (list nil)))
+    (multiple-value-bind (turns did response)
+        (llm-protocol:server-compact (%compacting-backend log :stop "max_tokens"
+                                                              :summary nil)
+                                     (%chat))
+      (ng did)
+      (ok (= 4 (length turns)) "the turns come back unchanged")
+      (ok (eq :length (llm-protocol:llm-response-finish-reason response)))))
+  (testing "a pending tool call is refused before the request"
+    (let ((log (list nil)))
+      (ok (signals (llm-protocol:server-compact
+                    (%compacting-backend log)
+                    (list (llm-protocol:user-turn "q")
+                          (llm-protocol:make-llm-turn
+                           :role :assistant
+                           :parts (list (llm-protocol:make-llm-tool-call-part
+                                         :id "t1" :name "f")))))
+                   'llm-protocol:llm-error))
+      (ng (car log) "nothing was sent")))
+  (testing "blank or oversized instructions are refused"
+    (ok (signals (llm-protocol:server-compact (%compacting-backend (list nil)) (%chat)
+                                              :instructions "  ")
+                 'llm-protocol:llm-error))
+    (ok (signals (llm-protocol:server-compact (%compacting-backend (list nil)) (%chat)
+                                              :instructions (make-string 16385
+                                                                         :initial-element #\a))
+                 'llm-protocol:llm-error))))
+
+(deftest anthropic-parts-survive-part-state
+  (let* ((call (make-instance 'llm-protocol-anthropic::anthropic-tool-call-part
+                              :id "srv_1" :name "web_search" :arguments "{\"q\":\"x\"}"
+                              :server-p t :extras '(:caller "direct")))
+         (back (llm-protocol:part-from-state (llm-protocol:part-state call))))
+    (ok (llm-protocol-anthropic::anthropic-tool-call-server-p back)
+        "a server tool call stays a server tool call")
+    (ok (equal "direct" (getf (llm-protocol-anthropic:anthropic-tool-call-extras back)
+                              :caller)))
+    (ok (equal "{\"q\":\"x\"}" (llm-protocol:llm-tool-call-part-arguments back)))))

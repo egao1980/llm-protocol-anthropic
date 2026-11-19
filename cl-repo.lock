@@ -59,10 +59,10 @@
   "sha256:be7adeb3e5a1cb647d40f2a947789108735717cc78e4450a802dd952d53070db"
   :registry "https://ghcr.io" :source-digest
   "sha256:39583ce2afd20022489de131fbf4b0db0214c2227411597692dced8ed3213bcd")
- (:system "event-protocol" :version "0.2.1" :index-digest
-  "sha256:21831a416a2c9b2e937fc10ba58ef61b5de60309d7bca8685438d356984e6d4f"
+ (:system "event-protocol" :version "0.2.2" :index-digest
+  "sha256:27eb9222d9b71ffc681a00d936b2bafdf16f013c038f6c40f1fe37e8bb78b532"
   :registry "https://ghcr.io" :source-digest
-  "sha256:93704c64854b9f50558a7bf30f545bd2f968e3afc12bfdd6c62d23012d4368ef")
+  "sha256:8e7c4f99754f5af96e639ec19b6e2a417fdb9374f06c7da93228318ad3b63f3e")
  (:system "fast-http" :version "0.3.0" :index-digest
   "sha256:0393b3627120e911b2e9ea57e575f306f36a7a001dbb19a186ce58d078280df3"
   :registry "https://ghcr.io" :source-digest
@@ -75,10 +75,10 @@
   "sha256:8a8a49b0b8954e1437b08436aba27900a737661eff0016af923c3dd439756cc4"
   :registry "https://ghcr.io" :source-digest
   "sha256:13f97d7b4adfcdfe7710344d02b718174aa0cc90bedce3c2b97ce00eda0800dd")
- (:system "http-backend-async" :version "0.2.16" :index-digest
-  "sha256:c378976f17820ee8a8b743b93c6db1ca5456bb46d3bb2b405da1b5ae06455b4c"
+ (:system "http-backend-async" :version "0.2.19" :index-digest
+  "sha256:2553cc789d13c02f06560f3163dd3e15127e79467f06ea9824adffa37a8f8ee5"
   :registry "https://ghcr.io" :source-digest
-  "sha256:6e55267b857487c1fea1aaa6ccdd26fcbb76ceb7fde64b5b2f4c1497e9ee0d6a")
+  "sha256:5b749ccca91e37d2f1417a332d5de9e3e418db8693d1b3a5abdf46f78d404dc8")
  (:system "http-encoding-chipz" :version "0.1.1" :index-digest
   "sha256:23007d9d5aa05ff23cfa1776bf510f273423848404fb0b627d9fa17463cc5b46"
   :registry "https://ghcr.io" :source-digest
@@ -139,19 +139,23 @@
   "sha256:1f7f65a844ae267ee3ecd704bc77ab1adaf0f40bb429127c6eca03c32951f980"
   :registry "https://ghcr.io" :source-digest
   "sha256:54708f29566c4484c6d893da6f2e03aefc98082ae57689ba2a2c91111f0ffc6f")
- (:system "asdf-native" :version "0.3.0" :index-digest
-  "sha256:cc3d9c9f9fa4acd308db0ae655ec27157d5387107ed2fc1862e920eb6e2049a5"
+ (:system "asdf-native" :version "0.3.1" :index-digest
+  "sha256:4d19740d33fdd005b604ff79010dca932dbd6ede7da00cff9a196538af74ba5e"
   :registry "https://ghcr.io" :source-digest
-  "sha256:d8f5e240374f68674e2379c20955b753790efe39f7a7311710562d857ba9be1c")
+  "sha256:9e187e0dbfe013750cdfa36f31afab0de81bd82b1051f4faf7e620ce42dbbfbd")
  (:system "cl-stack-executors" :version "0.1.0" :index-digest
   "sha256:921143925008679764572132c84bc214d325bde4d091bab2baeebed71f38b9b3"
   :registry "https://ghcr.io" :source-digest
   "sha256:fbe3e088eac5cbd6ba08dc45c8fd19806e652f77a8cf374caa5653017c8e4e84")
- (:system "event-backend-libuv" :version "0.2.1" :index-digest
-  "sha256:55e0fa0222005252ade91ce3f6a560a56064244a667224c56270e8da89ecbf66"
+ (:system "event-backend-libuv" :version "0.2.2" :index-digest
+  "sha256:c9da1999b0d831ba9c0907af3e5b85c50bca935512396146abc82584c35cd246"
   :registry "https://ghcr.io" :source-digest
-  "sha256:bde1c3b2dcac937c5b69403d3faa91cd419c827cced08064c368563abfd042d0"
+  "sha256:f5db686c6e20fe40c4f713272c8b691583cc87f73452c84ef908d359d95e55a9"
   :overlay-digest
-  "sha256:1794e78fd7497426c696095ba333999077bd6273b54f2b8c132ebc22d9ccb700"
+  "sha256:e152657e62d658b4101d9181970e6c5c7c39b05778f4c9ed5bf4727c26cdab4d"
   :overlay-digests
-  ("sha256:1794e78fd7497426c696095ba333999077bd6273b54f2b8c132ebc22d9ccb700")))
+  ("sha256:e152657e62d658b4101d9181970e6c5c7c39b05778f4c9ed5bf4727c26cdab4d"))
+ (:system "llm-protocol" :version "0.5.0" :index-digest
+  "sha256:ab0af1016f7fd33db031eb265286c9ea1187df09d335b47acd8b75ac207da035"
+  :registry "https://ghcr.io" :source-digest
+  "sha256:6d578a2d8d380b3a6d30b7f64126828c59736debb73eda5f4602f9df51df27cb"))
