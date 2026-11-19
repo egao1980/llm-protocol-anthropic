@@ -921,7 +921,13 @@ a compaction request with a signed block (or, with SUMMARY NIL, nothing)."
           (ok (equal "keep names" (gethash "instructions" (gethash "compaction" body))))
           (ng (gethash "context_management" body)
               "threshold compaction is not combined with it")
-          (ok (equal "be brief" (gethash "system" body)) "same system prompt")
+          (ok (let ((system (gethash "system" body)))
+                ;; A string, or text blocks once prompt-cache marks it.
+                (if (stringp system)
+                    (equal "be brief" system)
+                    (some (lambda (b) (equal "be brief" (gethash "text" b)))
+                          (coerce system 'list))))
+              "same system prompt")
           (ok (search "compact-2026-09-04" (%beta-header headers)))))
       (testing "→ the system turn, then the signed block"
         (ok did)
