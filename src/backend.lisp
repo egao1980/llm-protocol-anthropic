@@ -513,6 +513,11 @@ messages of BODY. Copies what it changes."
     body))
 
 ;;; --- API-side compaction ---------------------------------------------------
+
+(defparameter +compaction-beta+ "compact-2026-09-04"
+  "Beta of on-demand compaction (SERVER-COMPACT, compaction.lisp): on the
+summarize request and on every request that carries its signed block.")
+
 ;;; The API summarizes earlier turns into a `compaction` block once the prompt
 ;;; crosses the trigger. The block comes back as an ANTHROPIC-BLOCK-PART and is
 ;;; sent back verbatim; the API drops everything before it.
@@ -540,7 +545,11 @@ messages of BODY. Copies what it changes."
   "Add a compact_20260112 edit unless the caller set context_management."
   (multiple-value-bind (v found) (%settings-extra-get settings :server-compaction)
     (let ((spec (if found v (anthropic-server-compaction backend))))
-      (when (and spec (not (nth-value 1 (gethash "context_management" body))))
+      (when (and spec
+                 (not (nth-value 1 (gethash "context_management" body)))
+                 ;; The API refuses threshold compaction next to a signed
+                 ;; (on-demand) block: that conversation compacts on demand.
+                 (not (%body-carries-signed-compaction-p body)))
         (setf (gethash "context_management" body)
               (%ht "edits" (vector (%compaction-edit spec)))))))
   body)
@@ -559,6 +568,9 @@ messages of BODY. Copies what it changes."
                        (or (search "clear_tool_uses" type)
                            (search "clear_thinking" type)))
                   (pushnew "context-management-2025-06-27" betas :test #'equal)))))
+    (when (or (nth-value 1 (gethash "compaction" body))
+              (%body-carries-signed-compaction-p body))
+      (pushnew +compaction-beta+ betas :test #'equal))
     (nreverse betas)))
 
 (defmethod compaction-part-p ((part anthropic-block-part))
