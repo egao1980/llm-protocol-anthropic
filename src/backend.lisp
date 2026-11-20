@@ -19,7 +19,9 @@
 (defclass anthropic-backend (llm-backend)
   ((base-url :initarg :base-url :accessor anthropic-base-url
              :initform +default-anthropic-base-url+)
-   (api-key :initarg :api-key :accessor anthropic-api-key :initform nil)
+   (api-key :initarg :api-key :initform nil
+            :documentation "NIL or an HTTP-PROTOCOL:SECRET (prints redacted).
+ANTHROPIC-API-KEY reads the plain string.")
    (default-model :initarg :default-model :accessor anthropic-default-model
                   :initform "claude-sonnet-4-20250514")
    (version :initarg :version :accessor anthropic-version
@@ -40,7 +42,40 @@ Per call: settings extra :server-compaction.")
                  :documentation "Mark prompt-cache breakpoints: T, NIL, or :AUTO
 (only for the :official dialect). Per call: settings extra :prompt-cache.")))
 
-(defun make-anthropic-backend (&key base-url api-key default-model version
+(defun %resolve-api-key (value supplied-p &rest env-names)
+  "API key from a constructor argument (llm-protocol#10).
+   Not supplied, or :ENV → the first non-empty ENV-NAMES variable.
+   NIL or :NONE → no key: the environment is not read.
+   A string or HTTP-PROTOCOL:SECRET → that key (an empty string is no key)."
+  (cond ((or (not supplied-p) (eq value :env))
+         (some #'%env env-names))
+        ((or (null value) (eq value :none)) nil)
+        ((http-protocol:secret-p value) value)
+        ((stringp value) (and (plusp (length value)) value))
+        (t (error 'llm-error
+                  :message (format nil "api-key must be a string, NIL, :none or :env, got a ~(~A~)"
+                                   (type-of value))))))
+
+(defun %key-secret (value)
+  "VALUE (string, SECRET or NIL) as a SECRET, or NIL."
+  (let ((v (http-protocol:reveal value)))
+    (and (stringp v) (plusp (length v)) (http-protocol:make-secret value))))
+
+(defmethod initialize-instance :after ((b anthropic-backend) &key)
+  (setf (slot-value b 'api-key) (%key-secret (slot-value b 'api-key))))
+
+(defgeneric anthropic-api-key (backend)
+  (:documentation "The plain API key string, or NIL.")
+  (:method ((b anthropic-backend))
+    (http-protocol:reveal (slot-value b 'api-key))))
+
+(defgeneric (setf anthropic-api-key) (value backend)
+  (:documentation "Set the key: a string, an HTTP-PROTOCOL:SECRET, or NIL.")
+  (:method (value (b anthropic-backend))
+    (setf (slot-value b 'api-key) (%key-secret value))
+    value))
+
+(defun make-anthropic-backend (&key base-url (api-key nil api-key-p) default-model version
                                  betas dialect request-fn (prompt-cache :auto)
                                  server-compaction)
   (make-instance 'anthropic-backend
@@ -48,8 +83,8 @@ Per call: settings extra :server-compaction.")
                  :prompt-cache prompt-cache
                  :base-url (or base-url (%env "ANTHROPIC_BASE_URL")
                                +default-anthropic-base-url+)
-                 :api-key (or api-key (%env "ANTHROPIC_API_KEY")
-                              (%env "ANTHROPIC_AUTH_TOKEN"))
+                 :api-key (%resolve-api-key api-key api-key-p
+                                           "ANTHROPIC_API_KEY" "ANTHROPIC_AUTH_TOKEN")
                  :default-model (or default-model (%env "ANTHROPIC_MODEL")
                                     "claude-sonnet-4-20250514")
                  :version (or version (%env "ANTHROPIC_VERSION")
@@ -124,12 +159,14 @@ STREAM-GENERATE from %BODY-BETAS), merged into anthropic-beta.")
              ("accept" . ,accept)
              ("anthropic-version" . ,(or (anthropic-version backend)
                                          +default-anthropic-version+)))))
-    (when (and (anthropic-api-key backend)
-               (plusp (length (anthropic-api-key backend))))
-      (push (cons "x-api-key" (anthropic-api-key backend)) h)
-      (push (cons "authorization"
-                  (format nil "Bearer ~a" (anthropic-api-key backend)))
-            h))
+    (let ((key (slot-value backend 'api-key)))
+      (when key
+        ;; SECRETs: backtraces and conditions print them redacted (#54)
+        (push (cons "x-api-key" key) h)
+        (push (cons "authorization"
+                    (http-protocol:make-secret
+                     (concatenate 'string "Bearer " (http-protocol:reveal key))))
+              h)))
     (let ((betas (remove-duplicates
                   (append (if (stringp (anthropic-betas backend))
                               (list (anthropic-betas backend))
