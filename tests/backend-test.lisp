@@ -241,9 +241,11 @@
       (ok (equal "be brief" (%block-text (gethash "system" seen))))
       (ok (zerop (gethash "temperature" seen)))
       (ok (= 16 (gethash "max_tokens" seen)))
-      (ok (equal "sk-test" (cdr (assoc "x-api-key" seen-headers :test #'string-equal))))
+      (ok (equal "sk-test" (http-protocol:reveal
+                            (cdr (assoc "x-api-key" seen-headers :test #'string-equal)))))
       (ok (equal "Bearer sk-test"
-                 (cdr (assoc "authorization" seen-headers :test #'string-equal))))
+                 (http-protocol:reveal
+                  (cdr (assoc "authorization" seen-headers :test #'string-equal)))))
       (ok (equal "2023-06-01"
                  (cdr (assoc "anthropic-version" seen-headers :test #'string-equal)))))))
 
