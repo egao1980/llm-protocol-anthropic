@@ -12,6 +12,52 @@
   (let ((v (uiop:getenv name)))
     (and v (plusp (length v)) v)))
 
+(defparameter +default-anthropic-request-timeout+ 600
+  "Seconds a non-streaming request may take in all (the model generates the
+whole answer before the first byte).")
+
+(defparameter +default-anthropic-stream-idle-timeout+ 300
+  "Seconds a streaming response may stay silent. A stream that keeps
+producing tokens is never cut off, however long it runs.")
+
+(defparameter +default-anthropic-connect-timeout+ 30
+  "Seconds to establish TCP / TLS.")
+
+(defun %timeout-seconds-value (value what)
+  "VALUE as seconds: a positive real, or NIL for no limit (0 too)."
+  (cond ((null value) nil)
+        ((and (realp value) (zerop value)) nil)
+        ((and (realp value) (plusp value)) value)
+        (t (error 'llm-error
+                  :message (format nil "~a must be seconds (a positive number) or NIL, got ~s"
+                                   what value)))))
+
+(defun %env-seconds (name)
+  "→ (values seconds found-p) from env NAME: a number of seconds, or
+0 / none / off for no limit. Unset or empty → (values nil nil)."
+  (let ((v (%env name)))
+    (cond
+      ((null v) (values nil nil))
+      ((member (string-trim " " v) '("none" "off" "nil") :test #'string-equal)
+       (values nil t))
+      (t
+       (let ((n (ignore-errors
+                 (with-standard-io-syntax
+                   (let ((*read-eval* nil))
+                     (read-from-string v))))))
+         (unless (and (realp n) (not (minusp n)))
+           (error 'llm-error
+                  :message (format nil "~a must be seconds (a number, or none), got ~s"
+                                   name v)))
+         (values (%timeout-seconds-value n name) t))))))
+
+(defun %resolve-seconds (value supplied-p env default what)
+  "An initarg (NIL = no limit) wins; else env ENV; else DEFAULT."
+  (if supplied-p
+      (%timeout-seconds-value value what)
+      (multiple-value-bind (v found) (%env-seconds env)
+        (if found v default))))
+
 (defvar *anthropic-dialect* :official
   "Bound while wiring a request. :official = Anthropic-native tool types.
    :compat = flatten to name + input_schema (vLLM / llama-server).")
@@ -37,6 +83,20 @@ ANTHROPIC-API-KEY reads the plain string.")
 NIL, T (API default trigger), an integer trigger in input tokens (>= 50000),
 or a plist (:trigger n :instructions s :pause-after-compaction b).
 Per call: settings extra :server-compaction.")
+   (request-timeout :initarg :request-timeout :accessor anthropic-request-timeout
+                    :initform +default-anthropic-request-timeout+
+                    :documentation "Seconds a non-streaming request may take in all,
+or NIL for no cap. Env ANTHROPIC_TIMEOUT.")
+   (stream-idle-timeout :initarg :stream-idle-timeout
+                        :accessor anthropic-stream-idle-timeout
+                        :initform +default-anthropic-stream-idle-timeout+
+                        :documentation "Seconds a streaming response may stay silent, or
+NIL for no limit. Streams have no total cap: one that keeps producing tokens
+runs to the end. Env ANTHROPIC_STREAM_IDLE_TIMEOUT.")
+   (connect-timeout :initarg :connect-timeout :accessor anthropic-connect-timeout
+                    :initform +default-anthropic-connect-timeout+
+                    :documentation "Seconds to connect (TCP + TLS), or NIL.
+Env ANTHROPIC_CONNECT_TIMEOUT.")
    (prompt-cache :initarg :prompt-cache :accessor anthropic-prompt-cache
                  :initform :auto
                  :documentation "Mark prompt-cache breakpoints: T, NIL, or :AUTO
@@ -77,8 +137,28 @@ Per call: settings extra :server-compaction.")
 
 (defun make-anthropic-backend (&key base-url (api-key nil api-key-p) default-model version
                                  betas dialect request-fn (prompt-cache :auto)
-                                 server-compaction)
+                                 server-compaction
+                                 (request-timeout nil request-timeout-p)
+                                 (stream-idle-timeout nil stream-idle-timeout-p)
+                                 (connect-timeout nil connect-timeout-p))
+  "Timeouts are seconds, NIL for no limit. Left out, each reads its env var,
+then the default: :REQUEST-TIMEOUT (ANTHROPIC_TIMEOUT, 600) caps a
+non-streaming request; :STREAM-IDLE-TIMEOUT (ANTHROPIC_STREAM_IDLE_TIMEOUT,
+300) fails a stream silent that long, with no total cap; :CONNECT-TIMEOUT
+(ANTHROPIC_CONNECT_TIMEOUT, 30). A custom :REQUEST-FN owns its own timeouts."
   (make-instance 'anthropic-backend
+                 :request-timeout (%resolve-seconds
+                                   request-timeout request-timeout-p "ANTHROPIC_TIMEOUT"
+                                   +default-anthropic-request-timeout+ :request-timeout)
+                 :stream-idle-timeout (%resolve-seconds
+                                       stream-idle-timeout stream-idle-timeout-p
+                                       "ANTHROPIC_STREAM_IDLE_TIMEOUT"
+                                       +default-anthropic-stream-idle-timeout+
+                                       :stream-idle-timeout)
+                 :connect-timeout (%resolve-seconds
+                                   connect-timeout connect-timeout-p
+                                   "ANTHROPIC_CONNECT_TIMEOUT"
+                                   +default-anthropic-connect-timeout+ :connect-timeout)
                  :server-compaction server-compaction
                  :prompt-cache prompt-cache
                  :base-url (or base-url (%env "ANTHROPIC_BASE_URL")
@@ -195,13 +275,25 @@ STREAM-GENERATE from %BODY-BETAS), merged into anthropic-beta.")
     (let ((n (parse-integer value :junk-allowed t)))
       (and (integerp n) (<= 0 n) n))))
 
-(defun %http-request (method url &key headers content want-stream)
+(defun %request-timeout-spec (backend want-stream)
+  "http-protocol timeout plist for one request.
+   Streaming: :CONNECT + :READ (idle), no :TOTAL, so a stream that keeps
+   producing tokens is never cut off. Non-streaming: :CONNECT + :TOTAL
+   (the server is silent until the whole answer is ready)."
+  (let ((connect (anthropic-connect-timeout backend)))
+    (if want-stream
+        (list :connect connect :read (anthropic-stream-idle-timeout backend))
+        (list :connect connect :total (anthropic-request-timeout backend)))))
+
+(defun %http-request (method url &key headers content want-stream
+                                   (timeout (list :connect +default-anthropic-connect-timeout+
+                                                  :total +default-anthropic-request-timeout+)))
   (unless http-protocol:*http-backend*
     (error 'llm-error
            :message "*http-backend* is nil — bind an http-protocol backend"))
   (let ((res (apply #'http:request method url
                     :headers headers
-                    :timeout 180
+                    :timeout timeout
                     :want-stream (and want-stream t)
                     (and content (list :content content)))))
     (values (http-protocol:response-status res)
@@ -211,7 +303,7 @@ STREAM-GENERATE from %BODY-BETAS), merged into anthropic-beta.")
             (%retry-after (http-protocol:response-header res "retry-after")))))
 
 (defun %request (backend method path &optional object &key want-stream accept)
-  (let* ((fn (or (anthropic-request-fn backend) #'%http-request))
+  (let* ((custom (anthropic-request-fn backend))
          (url (%join (anthropic-base-url backend) path))
          (content (and object (stack-json:encode object)))
          (headers (%headers backend
@@ -220,8 +312,14 @@ STREAM-GENERATE from %BODY-BETAS), merged into anthropic-beta.")
                                             "text/event-stream"
                                             "application/json")))))
     (multiple-value-bind (status body retry-after)
-        (funcall fn method url :headers headers :content content
-                 :want-stream want-stream)
+        (if custom
+            ;; a custom transport keeps its call shape and owns its timeouts
+            (funcall custom method url :headers headers :content content
+                     :want-stream want-stream)
+            (%http-request method url :headers headers :content content
+                                      :want-stream want-stream
+                                      :timeout (%request-timeout-spec
+                                                backend want-stream)))
       (values status body retry-after))))
 
 (defun %error-message (obj fallback)

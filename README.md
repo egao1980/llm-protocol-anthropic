@@ -29,6 +29,16 @@ vLLM / llama-server (same class, **`:dialect :compat`**):
 
 Compat **flattens** Anthropic-native tools (`web_search_20260209`, …) to `{name, input_schema}` — vLLM / llama-server do not speak official tool types. Server-side `server_tool_use` is rewritten to `tool_use` on the way out. `:native-tools` is **official only**. vLLM tools need `--enable-auto-tool-choice`. Official default: `https://api.anthropic.com/v1`, model `claude-sonnet-4-20250514`. Env: `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` / `ANTHROPIC_VERSION` / `ANTHROPIC_BETA`. Headers: `x-api-key` **and** `Authorization: Bearer` (vLLM wants bearer) + `anthropic-version: 2023-06-01`. `max_tokens` is required — default **4096**.
 
+**Timeouts** (seconds; `nil`, `0` or env `none` = no limit). Left out, each reads its env var, then the default:
+
+| Initarg | Env | Default | Bounds |
+|---|---|---|---|
+| `:request-timeout` | `ANTHROPIC_TIMEOUT` | 600 | a non-streaming request, in all (the server says nothing until the whole answer is ready) |
+| `:stream-idle-timeout` | `ANTHROPIC_STREAM_IDLE_TIMEOUT` | 300 | silence on a streaming response. Streams have no total cap: one that keeps producing tokens runs to the end |
+| `:connect-timeout` | `ANTHROPIC_CONNECT_TIMEOUT` | 30 | TCP + TLS setup |
+
+They map onto `http-protocol` phases: `(:connect C :read IDLE)` for streams and `(:connect C :total T)` otherwise. The read (idle) phase needs `http-backend-async` 0.2.25 or later. A timeout signals `http-protocol:http-timeout-error` ("read timed out: no data for N s …"). It is not retried: model calls are POSTs, and `http-retry` only retries idempotent methods. A custom `:request-fn` owns its own timeouts. Readers: `anthropic-request-timeout`, `anthropic-stream-idle-timeout`, `anthropic-connect-timeout`.
+
 **API key** (`:api-key`): left out, or `:env`, reads `ANTHROPIC_API_KEY` then `ANTHROPIC_AUTH_TOKEN`. `nil`, `:none` or `""` means no key: no `x-api-key` or `Authorization` header, and the environment is not read. A string or an `http-protocol:secret` is used as given. The backend keeps the key as a `secret`, and both header values are secrets, so backtraces, condition reports and `describe` print `#<SECRET [redacted]>`. `anthropic-api-key` returns the plain string. A custom `:request-fn` gets header values that may be secrets: call `http-protocol:reveal` on them.
 
 Native tools (`make-web-search-tool`, `:bash`, …): official wire uses Anthropic `type`s; client tools (`bash` / `text_editor` / `computer` / `memory`) → you execute `tool_use`; server tools (`web_search` / `web_fetch` / `code_execution` / `tool_search`) → `server_tool_use` + `*_tool_result` in the same assistant message (`stop_reason` usually `end_turn`, finish `:stop`). Stream finish is `:tool-use` only when a **client** tool call is present.

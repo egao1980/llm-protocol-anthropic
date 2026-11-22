@@ -1,5 +1,5 @@
 (defsystem "llm-protocol-anthropic"
-  :version "0.4.0"
+  :version "0.5.0"
   :description "Anthropic Messages API backend for llm-protocol (official + vLLM / llama-server)"
   :author "egao1980"
   :license "MIT"
@@ -19,12 +19,15 @@
   :in-order-to ((test-op (test-op "llm-protocol-anthropic/tests"))))
 
 (defsystem "llm-protocol-anthropic/tests"
-  :depends-on ("llm-protocol-anthropic" "rove")
+  :depends-on ("llm-protocol-anthropic"
+               (:version "http-backend-async" "0.2.25") "event-backend-libuv"
+               "usocket" "bordeaux-threads" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
                (:file "backend-test")
-               (:file "keys-test"))
+               (:file "keys-test")
+               (:file "timeout-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
