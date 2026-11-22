@@ -10,6 +10,12 @@
            #:anthropic-api-key
            #:anthropic-default-model
            #:anthropic-version
+           #:anthropic-request-timeout
+           #:anthropic-stream-idle-timeout
+           #:anthropic-connect-timeout
+           #:+default-anthropic-request-timeout+
+           #:+default-anthropic-stream-idle-timeout+
+           #:+default-anthropic-connect-timeout+
            #:+default-anthropic-base-url+
            #:+default-vllm-base-url+
            #:+default-llama-server-base-url+
